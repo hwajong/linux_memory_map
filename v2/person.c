@@ -1,188 +1,185 @@
 #include "person.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <sys/mman.h>
+#include <stdio.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <signal.h>
+#include <unistd.h>
 
-Person *p = NULL;
-int fd = -1;
-int find = -1;
+#define FILE_MODE 0644
 
-static void print_usage(const char *prog)
-{
+// 전역변수 선언 
+static Person *person = NULL;
+static int fd_mp = -1;
+static int idx = -1;
+
+static void print_usage(const char *prog) {
 	fprintf(stderr, "usage: %s [-f file] [-w] [-s value] attr_name\n", prog);
 	fprintf(stderr, "  -f file  : person file, default is './person.dat'\n");
 	fprintf(stderr, "  -w       : watch mode\n");
 	fprintf(stderr, "  -s value : set the value for the given 'attr_name'\n");
 }
 
-// 시그널 핸들러 구현
-void sig_action(int signo, siginfo_t * siginfo, void *dumy)
-{
+/*
+   sighandler
+   시그널을 받으면 호출되는 함수 정의.
+*/
+static void sighandler(int signo, siginfo_t * siginfo, void *d) {
 	int offset;
 	const char *attr_name;
 
-	switch (signo)
-	{
-	case SIGINT:
-	case SIGTERM:
-		// watchers 에 저장된 pid 를 지우고 memory map 을 해제한다.
-		p->watchers[find] = 0;
-		munmap(p, sizeof(Person));
-		close(fd);
-		exit(0);
+	switch (signo) {
+	case SIGUSR1:
+		// 전달받은 offset 값으로 속성값을 찾고 출력한다.
+		offset = siginfo->si_value.sival_int;
+		attr_name = person_lookup_attr_with_offset(offset);
+
+		// 값이 정수일 경우
+		if(person_attr_is_integer(attr_name)) {
+			int *ptr_int = (int *)((char *)person + offset);
+			printf("%s: '%d' from '%d'\n", attr_name, *ptr_int, siginfo->si_pid);
+		}
+		// 값이 문자열일 경우 
+		else {
+			char *ptr_char = (char *)((char *)person + offset);
+			printf("%s: '%s' from '%d'\n", attr_name, ptr_char, siginfo->si_pid);
+		}
 		break;
 
-	case SIGUSR1:
-		// 파라미터로 받은 offset 값의로 변화된 속성값을 출력한다.
-		offset = siginfo->si_value.sival_int;
-		//printf("offset : %d\n", offset);
+	case SIGINT:
+	case SIGTERM:
+		// 저장했던 pid 를 지운다.
+		person->watchers[idx] = 0;
 
-		attr_name = person_lookup_attr_with_offset(offset);
-		//printf("attr_name : %s\n", attr_name);
+		// 메모리맵 해제
+		munmap(person, sizeof(Person));
 
-		if(person_attr_is_integer(attr_name))
-		{
-			int *ptr = (int *)((char *)p + offset);
-			printf("%s: '%d' from '%d'\n", attr_name, *ptr, siginfo->si_pid);
-		}
-		else
-		{
-			char *ptr = (char *)((char *)p + offset);
-			printf("%s: '%s' from '%d'\n", attr_name, ptr, siginfo->si_pid);
+		// 파일close
+		if(fd_mp) {
+			close(fd_mp);
 		}
 
+		exit(0);
 		break;
 	}
 }
 
-// watch 모드 동작 구현
-void do_watch_mode()
-{
+/*
+  watch 모드로 동작한다.
+*/
+static void watch_mode_proc() {
+	struct sigaction new_sa, old_sa;
 	int i;
-	struct sigaction act_new;
-	struct sigaction act_old;
 
-	// 시그널 핸들러 등록
-	act_new.sa_sigaction = sig_action;
-	sigemptyset(&act_new.sa_mask);
-	act_new.sa_flags = SA_SIGINFO;
-	sigaction(SIGINT, &act_new, &act_old);
-	sigaction(SIGTERM, &act_new, &act_old);
-	sigaction(SIGUSR1, &act_new, &act_old);
+	new_sa.sa_sigaction = sighandler;
+	sigemptyset(&new_sa.sa_mask);
+	new_sa.sa_flags = SA_SIGINFO;
 
-	// watchers 배열에서 빈곳 을 찾는다.
-	find = 0;
-	for(i = 0; i < NOTIFY_MAX; i++)
-	{
-		if(p->watchers[i] == 0)
-		{
-			find = i;
+	// sigaction 핸들러 등록
+	sigaction(SIGUSR1, &new_sa, &old_sa);
+	sigaction(SIGINT, &new_sa, &old_sa);
+	sigaction(SIGTERM, &new_sa, &old_sa);
+
+	// pid 저장을 위해 watchers 배열에서 값이 0인 인덱스를 찾는다.
+	// 없으면 0 번째에 저장.
+	idx = 0;
+	for(i = 0; i < NOTIFY_MAX; i++) {
+		if(person->watchers[i] == 0) {
+			idx = i;
 			break;
 		}
 	}
 
 	// pid 저장
-	p->watchers[find] = getpid();
-	//printf("pid : %d\n", p->watchers[find]);
+	person->watchers[idx] = getpid();
 
 	printf("watching...\n");
-	while (1)
-	{
+	while (1) {
+		// 시그널을 받을 때까지 기다린다.
 		pause();
 	}
 }
 
-// 메모리맵을 설정한다.
-void memory_map(const char *fname)
-{
-	Person person;
-	int nwrite = 0;
-
-	fd = open(fname, O_RDWR, 0644);
-	if(fd == -1)
-	{
-		// 파일이 없으면 파일을 만들어 Person 구조체 크기만큼 공간을 잡는다.
-		fd = open(fname, O_RDWR | O_CREAT, 0644);
-		if(fd == -1)
-		{
-			perror("File Open Error");
-			exit(-1);
-		}
-
-		memset(&person, 0, sizeof(Person));
-		nwrite = write(fd, &person, sizeof(Person));
-		if(nwrite != sizeof(Person))
-		{
-			perror("File Write Error");
-			exit(-1);
-		}
-	}
-
-	// memory map 설정
-	p = (Person *) mmap(0, sizeof(Person), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-	if(p == MAP_FAILED)
-	{
-		perror("mmap error");
-		exit(-1);
-	}
-}
-
-// 메모리 맵에 저장하고 watcher 프로세스에 시그널을 준다.
-void set_and_notify(const char *attr_name, const char *set_value)
-{
+/*
+  입력받은 속성값을 메모리맵에 저장한 후 wait 모드로 동작하고 있는
+  프로세스 모두에게 시그널을 보낸다.
+*/
+void set_mode_proc(const char *attr_name, const char *value) {
 	int i;
 	int offset = -1;
+
 	offset = person_get_offset_of_attr(attr_name);
-	//printf("offset of %s : %d\n", attr_name, offset);
-	if(offset == -1)
-	{
+	if(offset == -1) {
 		printf("invalid attr name '%s'\n", attr_name);
-		exit(-1);
+		exit(1);
 	}
 
-	if(person_attr_is_integer(attr_name))
-	{
-		int *ptr = (int *)((char *)p + offset);
-		if(set_value != NULL)
-			*ptr = atoi(set_value);
-		printf("%d\n", *ptr);
+	if(person_attr_is_integer(attr_name)) {
+		int *ptr_int = (int *)((char *)person + offset);
+		if(value != NULL) {
+			*ptr_int = atoi(value);
+		}
+		printf("%d\n", *ptr_int);
 	}
-	else
-	{
-		char *ptr = (char *)((char *)p + offset);
-		if(set_value != NULL)
-			strcpy(ptr, set_value);
-		printf("%s\n", ptr);
+	else {
+		char *ptr_char = (char *)((char *)person + offset);
+		if(value != NULL) {
+			strcpy(ptr_char, value);
+		}
+		printf("%s\n", ptr_char);
 	}
 
-	if(set_value == NULL)
+	if(value == NULL) {
 		return;
+	}
 
-	// watcher 프로세스에게 알림.
-	for(i = 0; i < NOTIFY_MAX; i++)
-	{
+	//wait 모드로 동작하고 있는 프로세스 모두에게 시그널을 보낸다.
+	for(i = 0; i < NOTIFY_MAX; i++) {
 		int pid;
-		pid = p->watchers[i];
-		//printf("pid : %d\n", pid);
-		if(pid != 0)
-		{
-			int ret;
-			union sigval val;
-			val.sival_int = offset;
-			ret = sigqueue(pid, SIGUSR1, val);
-			if(ret != 0)
-			{
-				perror("sigqueue error");
+		pid = person->watchers[i];
+		if(pid != 0) {
+			int result;
+			union sigval sig_val;
+			sig_val.sival_int = offset;
+			result = sigqueue(pid, SIGUSR1, sig_val);
+			if(result != 0) {
+				perror("sigqueue");
+				exit(1);
 			}
 		}
 	}
 }
 
-int main(int argc, char **argv)
-{
+/*
+  파일을 열고 메모리맵을 설정한다.
+*/
+static void setup_memory_map(const char *file_name) {
+	Person person_empty;
+	int n = 0;
+
+	fd_mp = open(file_name, O_RDWR, FILE_MODE);
+	if(fd_mp == -1) {
+		// 지정한 파일이 없으면 파일을 만들고
+		// Person 구조체 변수를 초기화 한후 write 한다.
+		fd_mp = open(file_name, O_RDWR | O_CREAT, FILE_MODE);
+
+		memset(&person_empty, 0, sizeof(Person));
+		n = write(fd_mp, &person_empty, sizeof(Person));
+		if(n != sizeof(Person)) {
+			perror("write");
+			exit(1);
+		}
+	}
+
+	// memory map 연결 
+	person = (Person *) mmap(0, sizeof(Person), PROT_WRITE | PROT_READ, MAP_SHARED, fd_mp, 0);
+	if(person == MAP_FAILED) {
+		perror("mmap");
+		exit(1);
+	}
+}
+
+int main(int argc, char **argv) {
 	const char *file_name;
 	const char *set_value;
 	const char *attr_name;
@@ -192,16 +189,14 @@ int main(int argc, char **argv)
 	file_name = "./person.dat";
 	set_value = NULL;
 	watch_mode = 0;
-	while (1)
-	{
+	while (1) {
 		int opt;
 
 		opt = getopt(argc, argv, "ws:f:");
 		if(opt < 0)
 			break;
 
-		switch (opt)
-		{
+		switch (opt) {
 		case 'w':
 			watch_mode = 1;
 			break;
@@ -218,29 +213,23 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if(!watch_mode && optind >= argc)
-	{
+	if(!watch_mode && optind >= argc) {
 		print_usage(argv[0]);
 		return -1;
 	}
 
 	attr_name = argv[optind];
 
-	// 메모리맵 설정
-	memory_map(file_name);
+	// 파일을 열고 메모리맵을 설정한다.
+	setup_memory_map(file_name);
 
 	if(watch_mode)
-	{
-		// watch 모드로 동작
-		do_watch_mode();
-	}
+		watch_mode_proc();
 	else
-	{
-		set_and_notify(attr_name, set_value);
-	}
+		set_mode_proc(attr_name, set_value);
 
-	munmap(p, sizeof(Person));
-	close(fd);
+	munmap(person, sizeof(Person));
+	close(fd_mp);
 
 	return 0;
 }
